@@ -188,6 +188,8 @@ TAVILY_API_KEY 是 key，需要去官方 tavily 申请一下
 
 
 
+### 什么是 A2A
+
 A2A（Agent2Agent Protocol） 是 Google 在 2025 年 4 月 发布的开放协议，后贡献给 Linux Foundation，目标是让 不同厂商、不同框架、不同组织 构建的 AI Agent 能互相发现、认证、协作、完成任务
 
 
@@ -254,12 +256,17 @@ A2A 协议定义了三个角色，看它们如何各司其职、协同配合，�
 └──────────────────┘                      └──────────────────┘
 ```
 
-| 角色                       | 职责                                                         |
-| -------------------------- | ------------------------------------------------------------ |
-| A2A Client（Client Agent） | 发现合适 Agent、认证、发起任务/消息、跟踪状态、收集产物      |
-| A2A Server（Remote Agent） | 发布 Agent Card、接收任务、执行技能、更新状态、返回 Artifacts |
+一个最小 A2A 交互包含两个角色：
 
+  - **A2A Client**：发起请求的一方
+  - **A2A Server**：暴露 A2A 接口、执行任务的一方
 
+ 
+
+这里的 Client 和 Server 是一次交互中的角色，不是永久身份。一个 Agent 完全可以同时是：
+
+  - 上游 Agent 的 A2A Server
+  - 下游 Agent 的 A2A Client
 
 
 
@@ -520,6 +527,7 @@ A2A = 跨 Agent 的任务协作协议
 执行：   Task（有生命周期的工作单）
 交流：   Message + Part（文本/文件/结构化数据）
 交付：   Artifact（结果产物）
+
 通道：   HTTP(S) + JSON-RPC（常见），可流式/可推送
 安全：   OpenAPI 风格鉴权 + 企业策略
 关系：   互补 MCP
