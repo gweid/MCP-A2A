@@ -6,6 +6,10 @@ A to A 协议关注智能体之间的交互，让不同的智能体（Agent）�
 
 ![](./imgs/img1.png)
 
+
+
+知识点汇总：
+
 - [MCP&A2A协议](./01-MCP&A2A协议.md)
   - [MCP 协议](./01-MCP&A2A协议.md#mcp-协议)
   - [A2A 协议](./01-MCP&A2A协议.md#a2a-协议)
