@@ -28,7 +28,7 @@ async function main(): Promise<void> {
   });
   const vectorStore = new InMemoryVectorStore(EMBEDDING_DIMENSION);
   const server = new McpServer({
-    name: "rag-ts",
+    name: "mcp-rag",
     version: "0.1.0",
   });
 

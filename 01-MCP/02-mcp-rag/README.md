@@ -14,7 +14,7 @@
 ## 安装与配置
 
 ```sh
-cd 02-mcp-rag/rag-ts
+cd 02-mcp-rag
 
 npm install
 

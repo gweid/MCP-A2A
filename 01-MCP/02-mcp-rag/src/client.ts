@@ -36,7 +36,7 @@ async function main(): Promise<void> {
   });
   const transport = createServerTransport();
   const mcp = new Client({
-    name: "rag-ts-client",
+    name: "mcp-rag-client",
     version: "0.1.0",
   });
   const terminal = createInterface({ input, output });

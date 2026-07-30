@@ -22,7 +22,7 @@ test("stdio Server 暴露 RAG 工具并安全处理空索引", async () => {
     stderr: "pipe",
   });
   const client = new Client({
-    name: "rag-ts-offline-test",
+    name: "mcp-rag-offline-test",
     version: "0.1.0",
   });
 
