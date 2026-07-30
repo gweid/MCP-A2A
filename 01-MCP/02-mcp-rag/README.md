@@ -1,7 +1,7 @@
 # MCP RAG
 
 - Client 固定先调用 MCP 检索，再使用 LLM 生成回答。
-- Server 使用阿里云百炼 `text-embedding-v4` 生成 1536 维向量。
+- Server 使用阿里云百炼的向量模型生成 1536 维向量。
 - 向量索引是纯 TypeScript 内存实现，按精确 L2 距离排序。
 - MCP 使用 stdio；Client 会自动启动 Server，不需要先单独运行 Server。
 
@@ -15,7 +15,9 @@
 
 ```sh
 cd 02-mcp-rag/rag-ts
+
 npm install
+
 cp .env.example .env
 ```
 
@@ -68,7 +70,7 @@ npm run check
 用户问题
   -> MCP retrieve_docs
   -> 相关文档文本
-  -> DeepSeek Chat
+  -> LLM Chat
   -> 最终回答
 ```
 
