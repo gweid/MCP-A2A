@@ -1570,3 +1570,660 @@ Server → Client：请求模型采样、用户输入、Roots
 
 
 
+传输层位于 `Protocol` 和具体通信介质之间：
+
+```yaml
+Client / Server / McpServer
+         │
+         ▼
+Protocol：ID 关联、路由、超时、取消、进度
+         │ JSONRPCMessage
+         ▼
+Transport：连接、分帧、HTTP/SSE、会话、认证上下文、恢复
+         │
+         ▼
+stdio / HTTP / SSE / WebSocket / InMemory 
+```
+
+
+
+**Transport 负责“消息怎么到达对端”；Protocol 负责“消息到达后怎么关联、分发和处理”**
+
+
+
+### Transport 接口
+
+[源码地址](https://github.com/modelcontextprotocol/typescript-sdk/blob/1.30.0/src/shared/transport.ts#L74)
+
+
+
+所有传输实现都遵循同一个接口：
+
+```yaml
+interface Transport {
+  start(): Promise<void>;
+
+  send(
+    message: JSONRPCMessage,
+    options?: TransportSendOptions,
+  ): Promise<void>;
+
+  close(): Promise<void>;
+
+  onclose?: () => void;
+  onerror?: (error: Error) => void;
+  onmessage?: (
+    message: JSONRPCMessage,
+    extra?: MessageExtraInfo,
+  ) => void;
+
+  sessionId?: string;
+  setProtocolVersion?: (
+    version: string,
+  ) => void;
+}
+```
+
+
+
+三个核心方法：
+
+| 方法      | 作用               |
+| --------- | ------------------ |
+| `start()` | 开始监听或建立连接 |
+| `send()`  | 发送 JSON-RPC 消息 |
+| `close()` | 关闭连接并释放资源 |
+
+三个核心回调：
+
+| 回调        | 触发场景                   |
+| ----------- | -------------------------- |
+| `onmessage` | 收到并解析出 JSON-RPC 消息 |
+| `onerror`   | 读写、解析或连接发生错误   |
+| `onclose`   | 连接关闭                   |
+
+### 与 Protocol 连接
+
+` Protocol.connect(transport)`：
+
+ 1. 先安装 Transport 回调：onmessage/onerror/onclose
+ 2. 再调用 transport.start()
+ 3. 出站消息调用 transport.send()
+ 4. 入站消息由 transport.onmessage() 交给 Protocol
+ 5. Transport 关闭时，Protocol 拒绝所有未完成请求
+
+
+
+因此通常不要手动调用 transport.start()：
+
+ ```ts
+ await client.connect(transport);
+ await server.connect(transport);
+ ```
+
+ 会自动启动 Transport
+
+
+
+### 传输方式
+
+
+| 场景 | 客户端 | 服务端 | 定位 |
+|------|--------|--------|------|
+| 本地子进程 | StdioClientTransport | StdioServerTransport | 推荐本地集成 |
+| 远程 HTTP | StreamableHTTPClientTransport | WebStandardStreamableHTTPServerTransport / StreamableHTTPServerTransport | 推荐远程传输 |
+| 旧 HTTP+SSE | SSEClientTransport | SSEServerTransport | 已废弃，仅兼容旧端 |
+| WebSocket | WebSocketClientTransport | SDK 没有对应服务端实现 | 自定义场景 |
+| 同进程 | 成对的 InMemoryTransport | 成对的 InMemoryTransport | 测试、嵌入式 |
+
+官方推荐：
+
+```yaml
+本地 MCP：stdio
+远程 MCP：Streamable HTTP
+```
+
+
+
+### stdio：本地进程管道
+
+相关源码：
+
+- [src/client/stdio.ts](https://github.com/modelcontextprotocol/typescript-sdk/blob/1.30.0/src/client/stdio.ts)
+- [src/server/stdio.ts](https://github.com/modelcontextprotocol/typescript-sdk/blob/1.30.0/src/server/stdio.ts)
+- [src/shared/stdio.ts](https://github.com/modelcontextprotocol/typescript-sdk/blob/1.30.0/src/shared/stdio.ts)
+
+
+
+#### 连接
+
+```yaml
+Client 进程
+   │
+   ├── 写入 Server 子进程 stdin
+   ├── 读取 Server 子进程 stdout
+   └── 读取 Server 子进程 stderr 日志
+```
+
+
+
+Client Transport 的 `start()` 负责启动 Server：
+
+```ts
+this._process = spawn(
+    this._serverParams.command,
+    this._serverParams.args ?? [],
+    {
+        env: {
+            ...getDefaultEnvironment(),
+            ...this._serverParams.env
+        },
+        stdio: [
+            'pipe',
+            'pipe',
+            this._serverParams.stderr ?? 'inherit'
+        ],
+        shell: false,
+        cwd: this._serverParams.cwd
+    });
+```
+
+
+
+Server Transport 不创建进程，只监听当前进程 stdin：
+
+```ts
+async start() {
+    this._started = true;
+    this._stdin.on('data', this._ondata);
+    this._stdin.on('error', this._onerror);
+}
+```
+
+
+
+#### 消息编码
+
+stdio 是连续字节流，因此 SDK 使用换行表示消息边界：
+
+```ts
+export function serializeMessage(message) {
+    return JSON.stringify(message) + '\n';
+}
+```
+
+
+
+发送一条消息：
+
+```text
+{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n
+```
+
+
+
+Client 发送到子进程 stdin：
+
+```ts
+const json = serializeMessage(message);
+
+if (this._process.stdin.write(json)) {
+    resolve();
+}
+else {
+    this._process.stdin.once(
+        'drain',
+        resolve);
+}
+```
+
+
+
+Server 则写入 stdout：
+
+```ts
+const json = serializeMessage(message);
+
+if (this._stdout.write(json)) {
+    resolve();
+}
+else {
+    this._stdout.once('drain', resolve);
+}
+```
+
+
+
+#### 消息接收
+
+数据可能被拆成任意大小的 chunk，因此先写入 `ReadBuffer`：
+
+```ts
+append(chunk) {
+    const newSize =
+        (this._buffer?.length ?? 0) +
+        chunk.length;
+
+    if (newSize > this._maxBufferSize) {
+        this.clear();
+        throw new Error(
+            `ReadBuffer exceeded maximum size`);
+    }
+
+    this._buffer = this._buffer
+        ? Buffer.concat([
+            this._buffer,
+            chunk
+        ])
+        : chunk;
+}
+```
+
+
+
+找到换行后切出完整消息：
+
+```ts
+readMessage() {
+    const index =
+        this._buffer.indexOf('\n');
+
+    if (index === -1) {
+        return null;
+    }
+
+    const line =
+        this._buffer
+            .toString('utf8', 0, index)
+            .replace(/\r$/, '');
+
+    this._buffer =
+        this._buffer.subarray(index + 1);
+
+    return JSONRPCMessageSchema.parse(
+        JSON.parse(line));
+}
+```
+
+
+
+然后触发：
+
+```ts
+this.onmessage?.(message);
+```
+
+
+
+服务端接收流程：
+
+```yaml
+process.stdin         监听
+    → data(Buffer)
+    → ReadBuffer
+    → JSON-RPC Message
+    → transport.onmessage
+```
+
+
+
+关键：
+
+```yaml
+消息边界：换行符
+连接状态：Server 子进程
+双向通道：stdin/stdout
+错误日志：stderr
+```
+
+stdout 中混入普通日志会被当作 JSON-RPC 解析，因此 Server 日志必须写 stderr
+
+
+
+### Streamable HTTP：远程传输
+
+相关源码：
+
+- [src/client/streamableHttp.ts](https://github.com/modelcontextprotocol/typescript-sdk/blob/1.30.0/src/client/streamableHttp.ts)
+- [src/server/streamableHttp.ts](https://github.com/modelcontextprotocol/typescript-sdk/blob/1.30.0/src/server/streamableHttp.ts)
+- [src/server/webStandardStreamableHttp.ts](https://github.com/modelcontextprotocol/typescript-sdk/blob/1.30.0/src/server/webStandardStreamableHttp.ts)
+
+
+
+#### 连接
+
+通过 POST 发送，JSON 或 SSE 响应
+
+```yaml
+Client --POST JSON----------> Server
+Client <--JSON Response------ Server
+
+或者
+
+Client --POST JSON----------> Server
+Client <--SSE Response Stream Server
+
+此外还可以：
+
+Client --GET SSE------------> Server
+Client <--Server 主动消息----- Server
+```
+
+
+
+Streamable HTTP 的 `start()` 不创建网络连接，只创建取消控制器：
+
+```ts
+async start() {
+    this._abortController =
+        new AbortController();
+}
+```
+
+真正的通信发生在 `send()`
+
+
+
+#### Client 发送 POST
+
+```ts
+const headers =
+    await this._commonHeaders();
+
+headers.set(
+    'content-type',
+    'application/json');
+
+headers.set(
+    'accept',
+    'application/json, text/event-stream');
+
+const response = await fetch(
+    this._url,
+    {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(message),
+        signal:
+            this._abortController?.signal
+    });
+```
+
+Client 明确告诉 Server：
+
+- 我发送 application/json
+- 我可以接收 application/json
+- 我也可以接收 text/event-stream
+
+
+
+#### Client 处理响应
+
+```ts
+if (response.status === 202) {
+    await response.body?.cancel();
+    return;
+}
+
+const responseMediaType =
+    mediaTypeEssence(
+        response.headers.get(
+            'content-type'));
+
+if (
+    responseMediaType ===
+    'text/event-stream'
+) {
+    this._handleSseStream(
+        response.body,
+        { onresumptiontoken },
+        false);
+}
+else if (
+    responseMediaType ===
+    'application/json'
+) {
+    const data =
+        await response.json();
+
+    const messages =
+        Array.isArray(data)
+            ? data
+            : [data];
+
+    for (const message of messages) {
+        this.onmessage?.(
+            JSONRPCMessageSchema.parse(
+                message));
+    }
+}
+```
+
+三类结果：
+
+| HTTP 响应           | 含义                     |
+| ------------------- | ------------------------ |
+| `202`               | 消息已接受，没有响应消息 |
+| `application/json`  | 直接返回 JSON-RPC 响应   |
+| `text/event-stream` | 通过 SSE 流返回消息      |
+
+#### Server 接收请求
+
+Server 根据 HTTP 方法分流：
+
+```ts
+switch (req.method) {
+    case 'POST':
+        return this.handlePostRequest(
+            req,
+            options);
+
+    case 'GET':
+        return this.handleGetRequest(req);
+
+    case 'DELETE':
+        return this.handleDeleteRequest(
+            req);
+
+    default:
+        return this
+            .handleUnsupportedRequest();
+}
+```
+
+含义:
+
+- POST：Client 发送 JSON-RPC 消息
+
+- GET：建立独立 SSE 推送流
+- DELETE：结束 session
+
+
+
+#### relatedRequestId
+
+Server 维护三张表：
+
+```ts
+this._streamMapping = new Map();
+this._requestToStreamMapping = new Map();
+this._requestResponseMap = new Map();
+```
+
+
+
+对应关系：
+
+```yaml
+streamId  → HTTP/SSE 响应流
+requestId → streamId
+requestId → JSON-RPC Response
+```
+
+
+
+relatedRequestId 在 HTTP Transport 中很重要，它决定消息应写到哪个响应流
+
+
+
+#### Session
+
+初始化时：
+
+ 1. 服务端识别 initialize request；
+ 2. 生成 session ID；
+ 3. 保存到当前 Transport 实例；
+ 4. 通过 HTTP response header 返回：`Mcp-Session-Id`
+
+
+
+客户端 send() 读取这个 header，保存它：
+
+```ts
+const sessionId = response.headers.get('mcp-session-id');
+
+if (sessionId) {
+    this._sessionId = sessionId;
+}
+```
+
+之后自动在 POST、GET、DELETE 请求中携带
+
+
+
+#### 恢复
+
+服务端先保存消息，再发送。核心接口：
+
+```ts
+interface EventStore {
+    storeEvent(
+        streamId: string,
+        message: JSONRPCMessage
+    ): Promise<string>;
+
+    replayEventsAfter(
+        lastEventId: string,
+        options: {
+            send(eventId: string, message: JSONRPCMessage): Promise<void>;
+        }
+    ): Promise<string>;
+}
+```
+
+
+
+发送 SSE 消息前，服务端先存储：
+
+```ts
+let eventId;
+
+if (this._eventStore) {
+    eventId = await this._eventStore.storeEvent(
+        streamId,
+        message
+    );
+}
+```
+
+
+
+然后把 Event ID 写入 SSE，即使 SSE 此时已经断开，消息仍然可以留在 `EventStore` 中
+
+```ts
+let eventData = `event: message\n`;
+
+if (eventId) {
+    eventData += `id: ${eventId}\n`;
+}
+
+eventData += `data: ${JSON.stringify(message)}\n\n`;
+```
+
+
+
+客户端解释 SSE 时，记录最后一个 Event ID
+
+
+
+假设收到：
+
+```
+id: E1
+id: E2
+id: E3
+```
+
+那么客户端保存的恢复位置就是：
+
+```
+lastEventId = E3
+```
+
+
+
+如果断开连接，重新建立连接时：服务端会将 E3 之后的消息补发
+
+
+
+假设 EventStore 中有：
+
+```
+E1
+E2
+E3  ← Last-Event-ID
+E4
+E5
+```
+
+那么恢复时只补发：
+
+```
+E4
+E5
+```
+
+之后新的消息继续通过这条新 SSE 连接发送
+
+
+
+一次完整的恢复：
+
+```yaml
+Client                                      Server
+  │                                            │
+  │ POST initialize                            │
+  ├───────────────────────────────────────────>│
+  │                                            │ 生成 Session S1
+  │ HTTP Response                              │
+  │ Mcp-Session-Id: S1                       │
+  │<───────────────────────────────────────────┤
+  │                                            │
+  │ GET /mcp                                   │
+  │ Mcp-Session-Id: S1                       │
+  ├───────────────────────────────────────────>│
+  │                                            │
+  │ SSE: id=E1, message=A                      │
+  │<───────────────────────────────────────────┤
+  │ SSE: id=E2, message=B                      │
+  │<───────────────────────────────────────────┤
+  │                                            │
+  │             网络断开                        │
+  │                                            │ 存储 E3、E4
+  │                                            │
+  │ GET /mcp                                   │
+  │ Mcp-Session-Id: S1                       │
+  │ Last-Event-ID: E2                        │
+  ├───────────────────────────────────────────>│
+  │                                            │
+  │ 补发 E3                                    │
+  │<───────────────────────────────────────────┤
+  │ 补发 E4                                    │
+  │<───────────────────────────────────────────┤
+  │                                            │
+  │ 后续实时消息 E5                              │
+  │<───────────────────────────────────────────┤
+```
+
+
+
