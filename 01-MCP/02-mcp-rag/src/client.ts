@@ -30,7 +30,7 @@ const medicalDocuments = [
 async function main(): Promise<void> {
   console.log(">>> 开始初始化 RAG 系统");
 
-  const deepSeek = new OpenAI({
+  const LLM = new OpenAI({
     apiKey: requiredEnvironmentVariable("LLM_API_KEY"),
     baseURL: requiredEnvironmentVariable("LLM_API_URL"),
   });
@@ -77,7 +77,7 @@ async function main(): Promise<void> {
       });
       const context = extractToolText(retrievalResult);
 
-      const response = await deepSeek.chat.completions.create({
+      const response = await LLM.chat.completions.create({
         model: requiredEnvironmentVariable("LLM_API_MODEL"),
         messages: [
           {
@@ -94,7 +94,7 @@ async function main(): Promise<void> {
       const answer = response.choices[0]?.message.content?.trim();
 
       if (!answer) {
-        throw new Error("DeepSeek 返回了空回答。");
+        throw new Error("LLM 返回了空回答。");
       }
 
       console.log("检索结果：\n", context);
