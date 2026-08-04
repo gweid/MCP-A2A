@@ -2227,3 +2227,580 @@ Client                                      Server
 
 
 
+## 资源发现
+
+
+
+#### 什么是 MCP Resources
+
+MCP 中的资源（Resources）：将数据内容通过可以被客户端读取的方式暴露给 LLM，用作对话或生成时的上下文
+
+![](./imgs/img10.png)
+
+
+
+这里的资源可以是任意类型的文本或二进制数据，包括文件内容、数据库记录、API 响应、日志、截图、音频、视频等
+
+![](./imgs/img11.png)
+
+
+
+每个资源都由 **唯一的 URI** 确定，遵循通用的 `[协议]😕/[主机]/[路径]` 形式，例如：
+
+```yaml
+file:///home/user/docs/report.pdf
+postgres://db.example.com/customers/schema
+screen://localhost/display
+docs://manual/getting-started
+config://application
+git://repo/commit/abc123
+```
+
+MCP 服务器可根据需要自定义 URI 方案，并在文档中说明各字段含义
+
+资源是 **应用控制** 的，意味着客户端应用程序可以决定如何以及何时使用这些资源
+
+
+
+### 资源的定义与发现
+
+在 MCP 协议中，“服务端资源的定义和发现”是指服务器如何声明（定义）它能提供的各种数据内容，以及客户端如何探测（发现）并访问这些资源
+
+
+
+#### 服务端资源定义
+
+MCP 服务器需要用一个统一的数据结构来描述每个资源对象，主要包括：
+
+| 字段        | 类型        | 必填 | 说明                                                 |
+| ----------- | ----------- | ---- | ---------------------------------------------------- |
+| uri         | string      | ✅    | 资源的唯一标识符，必须符合 RFC 3986 URI 语法         |
+| name        | string      | ✅    | 人类可读的名称                                       |
+| title       | string      | 可选 | 附加标题（1.30.0 新增字段）                          |
+| description | string      | 可选 | 详细描述，帮助客户端判断何时使用                     |
+| mimeType    | string      | 可选 | 内容类型，如 text/plain、application/json、image/png |
+| size        | number      | 可选 | 资源大小（字节）                                     |
+| annotations | Annotations | 可选 | 给客户端的额外上下文提示                             |
+| icons       | Icon[]      | 可选 | 资源图标（1.30.0 扩展）                              |
+| _meta       | Record      | 可选 | 客户端不可见的元数据                                 |
+
+
+
+支持资源功能的服务器必须声明 resources 能力：
+
+```ts
+const server = new McpServer(
+  {
+    name: "resource-demo",
+    version: "1.0.0"
+  },
+  {
+    capabilities: {
+      resources: {
+        subscribe: true
+        listChanged: true
+      }
+    }
+  }
+);
+```
+
+- subscribe：客户端是否可以订阅单个资源的变更通知
+- listChanged：当资源列表变化时，服务器是否会发送通知
+
+这两项均为可选，服务器可以只支持其中一个或两个都支持，也可以都不支持：
+
+```ts
+{
+  "capabilities": {
+    "resources": {} // 两项都不支持
+  }
+}
+```
+
+
+
+MCP 把资源分成两类：静态资源与动态模板资源
+
+
+
+**静态资源**
+
+MCP 可以通过底层 Server 或者高层 McpServer 去定义资源；更推荐使用 McpServer
+
+```ts
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+
+const server = new McpServer({
+ name: "document-server",
+ version: "1.0.0",
+});
+
+const registered = server.registerResource(
+ "project-readme",
+ "project:///README.md",
+ {
+   title: "Project README",
+   description: "项目说明文档",
+   mimeType: "text/markdown",
+   annotations: {
+     audience: ["user", "assistant"],
+     priority: 0.8,
+   },
+ },
+ async (uri, extra) => {
+   // 对敏感资源，应在这里根据 extra/authInfo 再次检查权限。
+   return {
+     contents: [
+       {
+         uri: uri.href,
+         mimeType: "text/markdown",
+         text: "# Project\n\nProject documentation.",
+       },
+     ],
+   };
+ },
+); 
+```
+
+
+
+注册返回的 RegisteredResource 支持动态管理
+
+```ts
+registered.disable();
+registered.enable();
+
+registered.update({
+ description: "...", // 实际 update 参数中通过 metadata 更新
+});
+
+registered.update({
+ metadata: {
+   title: "New Title",
+   mimeType: "text/markdown",
+ },
+});
+
+registered.remove();
+```
+
+注册、更新、启用、禁用、删除都会触发资源目录变化通知
+
+
+
+**动态资源**
+
+当 URI 不是固定时，使用模板
+
+例如：
+
+ ```text
+ users:///profiles/{userId}
+ database:///schemas/{schema}/tables/{table}
+ git:///repositories/{repository}/commits/{commit}
+ ```
+
+
+
+注册模板：
+
+```ts
+ import {
+   McpServer,
+   ResourceTemplate,
+ } from "@modelcontextprotocol/sdk/server/mcp.js";
+
+ const users = ["alice", "bob", "charlie"];
+
+ const profileTemplate = new ResourceTemplate(
+   "users:///profiles/{userId}",
+   {
+     /**
+      * 是否能枚举该模板下的具体资源。
+      * 即使不支持，也必须显式写 list: undefined。
+      */
+     list: async () => ({
+       resources: users.map((userId) => ({
+         uri: `users:///profiles/${encodeURIComponent(userId)}`,
+         name: `profile-${userId}`,
+         title: `${userId} Profile`,
+         mimeType: "application/json",
+       })),
+     }),
+
+     /**
+      * 可选：给客户端提供模板变量补全。
+      */
+     complete: {
+       userId: async (value) =>
+         users.filter((userId) => userId.startsWith(value)),
+     },
+   },
+ );
+
+ server.registerResource(
+   "user-profile",
+   profileTemplate,
+   {
+     title: "User Profile",
+     description: "按用户 ID 读取用户资料",
+     mimeType: "application/json",
+   },
+   async (uri, variables) => {
+     const rawUserId = variables.userId;
+     const userId = Array.isArray(rawUserId)
+       ? rawUserId[0]
+       : rawUserId;
+
+     return {
+       contents: [
+         {
+           uri: uri.href,
+           mimeType: "application/json",
+           text: JSON.stringify({
+             id: userId,
+             displayName: userId.toUpperCase(),
+           }),
+         },
+       ],
+     };
+   },
+ );
+```
+
+- new ResourceTemplate：定义了资源的**模式（Pattern）**、**如何列举（list）**和**如何补全（complete）**
+- server.registerResource：传入定义的模板，提供回调函数来处理具体的读取请求
+
+
+
+#### 客户端资源读取
+
+**能力协商**
+
+服务端在初始化响应中声明 resources 能力
+
+ ```json
+ {
+   "capabilities": {
+     "resources": {
+       "subscribe": true,
+       "listChanged": true
+     }
+   }
+ }
+ ```
+
+
+
+客户端连接后检查服务端能力：
+
+```ts
+const capabilities = client.getServerCapabilities();
+
+if (!capabilities?.resources) {
+  throw new Error("服务端不支持 MCP Resources");
+}
+```
+
+
+
+**资源发现**
+
+发现具体资源：`client.listResources`，对应协议方法：`resources/list`
+
+```ts
+const page = await client.listResources();
+
+for (const resource of page.resources) {
+  console.log(resource.name, resource.uri);
+}
+```
+
+
+
+发现模板资源：`client.listResourceTemplates`，对应协议方法：`resources/templates/list`
+
+```ts
+const page = await client.listResourceTemplates();
+
+for (const template of page.resourceTemplates) {
+  console.log(template.name, template.uriTemplate);
+}
+```
+
+
+
+**资源读取**
+
+无论 URI 来自静态列表还是模板实例化，读取方式都一样，通过 `client.readResource`：
+
+```ts
+const result = await client.readResource({
+  uri: "users:///profiles/alice",
+});
+
+for (const content of result.contents) {
+  if ("text" in content) {
+    console.log(content.text);
+  } else {
+    const bytes = Buffer.from(content.blob, "base64");
+    console.log(bytes);
+  }
+}
+```
+
+
+
+#### 资源变更
+
+资源变化分为两类：
+
+| 变化类型         | 通知                                   | 客户端操作       |
+| ---------------- | -------------------------------------- | ---------------- |
+| 资源目录变化     | `notifications/resources/list_changed` | 重新拉取两个目录 |
+| 某个资源内容变化 | `notifications/resources/updated`      | 重新读取该 URI   |
+
+
+
+**目录变更**
+
+注册资源后会自动启用：
+
+```ts
+const server = new McpServer(
+  {
+    name: "resource-demo",
+    version: "1.0.0"
+  },
+  {
+    capabilities: {
+      resources: {
+        listChanged: true
+      }
+    }
+  }
+);
+```
+
+新增、删除、启用、禁用或更新注册项时，会发送资源目录变化通知
+
+也可以手动发送：
+
+```ts
+server.sendResourceListChanged();
+```
+
+
+
+客户端监听变化：
+
+```ts
+import {
+  ResourceListChangedNotificationSchema,
+} from "@modelcontextprotocol/sdk/types.js";
+
+client.setNotificationHandler(
+  ResourceListChangedNotificationSchema,
+  async () => {
+    await refreshResourceCatalog();
+  },
+);
+
+// 处理全部分页
+async function refreshResourceCatalog(): Promise<void> {
+  const [resources, templates] = await Promise.all([
+    listAllResources(client),
+    listAllResourceTemplates(client),
+  ]);
+
+  replaceLocalResourceCatalog({
+    resources,
+    templates,
+  });
+}
+```
+
+
+
+也可以在构造时配置自动处理：
+
+```ts
+const client = new Client(
+  { name: "resource-client", version: "1.0.0" },
+  {
+    listChanged: {
+      resources: {
+        autoRefresh: false,
+        onChanged() {
+          void refreshResourceCatalog();
+        },
+      },
+    },
+  },
+);
+
+// 处理全部分页
+async function refreshResourceCatalog(): Promise<void> {
+  const [resources, templates] = await Promise.all([
+    listAllResources(client),
+    listAllResourceTemplates(client),
+  ]);
+
+  replaceLocalResourceCatalog({
+    resources,
+    templates,
+  });
+}
+```
+
+
+
+> 通知本身不描述哪些资源变化，只表示本地目录缓存已经失效
+
+
+
+**具体资源内容变化**
+
+单资源更新需要客户端先订阅：
+
+```ts
+await client.subscribeResource({
+  uri: "config://app",
+});
+```
+
+
+
+服务端随后可以发送：
+
+```ts
+await server.server.sendResourceUpdated({
+  uri: "config://app",
+});
+```
+
+
+
+并且服务端需要显式声明 capability，并实现订阅处理：
+
+```ts
+import {
+  SubscribeRequestSchema,
+  UnsubscribeRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
+
+const server = new McpServer(
+  {
+    name: "resource-server",
+    version: "1.0.0",
+  },
+  {
+    capabilities: {
+      resources: {
+        subscribe: true,
+      },
+    },
+  },
+);
+
+const subscriptions = new Set<string>();
+
+server.server.setRequestHandler(
+  SubscribeRequestSchema,
+  async (request) => {
+    subscriptions.add(request.params.uri);
+    return {};
+  },
+);
+
+server.server.setRequestHandler(
+  UnsubscribeRequestSchema,
+  async (request) => {
+    subscriptions.delete(request.params.uri);
+    return {};
+  },
+);
+
+async function notifyResourceChanged(uri: string) {
+  if (subscriptions.has(uri)) {
+    await server.server.sendResourceUpdated({ uri });
+  }
+}
+```
+
+
+
+客户端收到后重新读取：
+
+```ts
+import {
+  ResourceUpdatedNotificationSchema,
+} from "@modelcontextprotocol/sdk/types.js";
+
+client.setNotificationHandler(
+  ResourceUpdatedNotificationSchema,
+  async ({ params }) => {
+    const result = await client.readResource({
+      uri: params.uri,
+    });
+
+    updateResourceCache(
+      params.uri,
+      result.contents,
+    );
+  },
+);
+```
+
+
+
+不再需要时取消订阅：
+
+```ts
+await client.unsubscribeResource({
+  uri: "config://app",
+});
+```
+
+
+
+#### 注意点
+
+第一次调用 registerResource() 时，高层服务端会：
+
+ 1. 安装 Resource 请求处理器。
+ 2. 注册 resources capability。
+
+Capability 不能在 transport 已连接后注册。因此：
+
+ ```ts
+// 正确
+server.registerResource(...);
+
+await server.connect(transport);
+ ```
+
+只要 Resource 处理器已在连接前初始化，连接后继续增加、删除或更新资源才可以正常触发列表变化通知
+
+
+
+
+### MCP Resources 开发示例
+
+> 01-MCP/03-mcp-resources
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
